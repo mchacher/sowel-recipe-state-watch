@@ -1,0 +1,17 @@
+{
+  "id": "state-watch",
+  "type": "recipe",
+  "name": "State Watch",
+  "version": "1.0.0",
+  "description": "Monitor an equipment data key and raise an alarm when the value stays in a watched state",
+  "icon": "Eye",
+  "repo": "mchacher/sowel-recipe-state-watch",
+  "author": "mchacher",
+  "tags": ["automation", "monitoring", "alarm", "state"],
+  "i18n": {
+    "fr": {
+      "name": "Surveillance d'état",
+      "description": "Surveille une donnée d'équipement et déclenche une alarme si la valeur reste dans un état donné."
+    }
+  }
+}
