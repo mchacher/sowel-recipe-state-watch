@@ -7,11 +7,17 @@
   "icon": "Eye",
   "repo": "mchacher/sowel-recipe-state-watch",
   "author": "mchacher",
-  "tags": ["automation", "monitoring", "alarm", "state"],
+  "tags": [
+    "automation",
+    "monitoring",
+    "alarm",
+    "state"
+  ],
   "i18n": {
     "fr": {
       "name": "Surveillance d'état",
       "description": "Surveille une donnée d'équipement et déclenche une alarme si la valeur reste dans un état donné."
     }
-  }
+  },
+  "sowelVersion": ">=0.10.0"
 }
