@@ -89,6 +89,24 @@ function msUntilNextOccurrence(timeStr: string): number {
   return target.getTime() - now.getTime();
 }
 
+/** Minutes-of-day for an "HH:MM" string. NaN if malformed. */
+export function hmToMinutes(timeStr: string): number {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(timeStr);
+  if (!m) return NaN;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
+/**
+ * Is `nowMinutes` inside the window [startMin, endMin)? Supports a window that
+ * crosses midnight (start > end, e.g. 21:00 to 06:00). A zero-width window
+ * (start === end) is never active.
+ */
+export function isWithinWindow(nowMinutes: number, startMin: number, endMin: number): boolean {
+  if (startMin === endMin) return false;
+  if (startMin < endMin) return nowMinutes >= startMin && nowMinutes < endMin;
+  return nowMinutes >= startMin || nowMinutes < endMin;
+}
+
 // ============================================================
 // Recipe Definition
 // ============================================================
@@ -144,9 +162,18 @@ export function createRecipe(): RecipeDefinition {
         required: false,
       },
       {
-        id: "checkTime",
-        name: "Check Time",
-        description: "Daily check time — alarm if still in watched state (e.g., 23:00)",
+        id: "checkStart",
+        name: "Check Window Start",
+        description:
+          "Optional. Only alarm while the time is inside this window (start). Leave empty for permanent monitoring.",
+        type: "time",
+        required: false,
+      },
+      {
+        id: "checkEnd",
+        name: "Check Window End",
+        description:
+          "Optional. End of the check window. The window may cross midnight (e.g. 21:00 to 06:00).",
         type: "time",
         required: false,
       },
@@ -156,7 +183,7 @@ export function createRecipe(): RecipeDefinition {
       fr: {
         name: "Surveillance d'état",
         description:
-          "Surveille une donnée d'équipement et déclenche une alarme si la valeur reste dans un état donné. Supporte un délai, une répétition périodique et un check quotidien à heure fixe.",
+          "Surveille une donnée d'équipement et déclenche une alarme si la valeur reste dans un état donné. Surveillance permanente par défaut, avec délai, répétition et créneau horaire optionnels.",
         slots: {
           zone: { name: "Zone", description: "Zone de l'équipement à surveiller" },
           equipment: { name: "Équipement", description: "Équipement à surveiller" },
@@ -176,9 +203,15 @@ export function createRecipe(): RecipeDefinition {
             name: "Intervalle de répétition",
             description: "Intervalle de rappel tant que l'état persiste (ex: 1h)",
           },
-          checkTime: {
-            name: "Heure de vérification",
-            description: "Heure de check quotidien — alarme si encore dans l'état (ex: 23:00)",
+          checkStart: {
+            name: "Début du créneau",
+            description:
+              "Optionnel. N'alarme que si l'heure est dans ce créneau (début). Vide = surveillance permanente.",
+          },
+          checkEnd: {
+            name: "Fin du créneau",
+            description:
+              "Optionnel. Fin du créneau de surveillance. Le créneau peut passer minuit (ex: 21:00 à 06:00).",
           },
         },
       },
@@ -189,7 +222,8 @@ export function createRecipe(): RecipeDefinition {
     // ============================================================
 
     validate(params: Record<string, unknown>, ctx: RecipeContext): void {
-      const { zone, equipment, dataKey, watchValue, delay, repeatInterval, checkTime } = params;
+      const { zone, equipment, dataKey, watchValue, delay, repeatInterval, checkStart, checkEnd } =
+        params;
 
       // Validate zone
       if (!zone || typeof zone !== "string") {
@@ -225,28 +259,26 @@ export function createRecipe(): RecipeDefinition {
         throw new Error("Watch value parameter is required");
       }
 
-      // Validate at least one trigger mode
+      // Monitoring is permanent by default — delay, repeat and the check window
+      // are all optional refinements, so no "at least one trigger" requirement.
       const hasDelay = delay !== undefined && delay !== null && delay !== "";
       const hasRepeat =
         repeatInterval !== undefined && repeatInterval !== null && repeatInterval !== "";
-      const hasCheck = checkTime !== undefined && checkTime !== null && checkTime !== "";
-
-      if (!hasDelay && !hasRepeat && !hasCheck) {
-        throw new Error(
-          "At least one trigger mode is required: delay, repeatInterval, or checkTime",
-        );
-      }
-
-      // Validate duration formats
       if (hasDelay) ctx.helpers.parseDuration(delay);
       if (hasRepeat) ctx.helpers.parseDuration(repeatInterval);
 
-      // Validate time format
-      if (hasCheck) {
-        const timeStr = String(checkTime);
-        if (!/^\d{1,2}:\d{2}$/.test(timeStr)) {
-          throw new Error(`Invalid time format: ${timeStr}. Use HH:MM (e.g., "23:00")`);
-        }
+      // Check window: start and end must be provided together, both valid HH:MM.
+      const hasStart = checkStart !== undefined && checkStart !== null && checkStart !== "";
+      const hasEnd = checkEnd !== undefined && checkEnd !== null && checkEnd !== "";
+      if (hasStart !== hasEnd) {
+        throw new Error("The check window needs both a start and an end time");
+      }
+      const timeRe = /^\d{1,2}:\d{2}$/;
+      if (hasStart && !timeRe.test(String(checkStart))) {
+        throw new Error(`Invalid start time: ${String(checkStart)}. Use HH:MM (e.g., "21:00")`);
+      }
+      if (hasEnd && !timeRe.test(String(checkEnd))) {
+        throw new Error(`Invalid end time: ${String(checkEnd)}. Use HH:MM (e.g., "06:00")`);
       }
     },
 
@@ -271,16 +303,22 @@ export function createRecipe(): RecipeDefinition {
           ? ctx.helpers.parseDuration(params.repeatInterval)
           : null;
 
-      const checkTimeStr =
-        params.checkTime !== undefined && params.checkTime !== null && params.checkTime !== ""
-          ? String(params.checkTime)
+      const checkStartStr =
+        params.checkStart !== undefined && params.checkStart !== null && params.checkStart !== ""
+          ? String(params.checkStart)
           : null;
+      const checkEndStr =
+        params.checkEnd !== undefined && params.checkEnd !== null && params.checkEnd !== ""
+          ? String(params.checkEnd)
+          : null;
+      const hasWindow = checkStartStr !== null && checkEndStr !== null;
 
       // Instance state (closure variables)
       const unsubs: (() => void)[] = [];
       let delayTimer: ReturnType<typeof setTimeout> | null = null;
       let repeatTimer: ReturnType<typeof setTimeout> | null = null;
-      let checkTimer: ReturnType<typeof setTimeout> | null = null;
+      let windowStartTimer: ReturnType<typeof setTimeout> | null = null;
+      let windowEndTimer: ReturnType<typeof setTimeout> | null = null;
 
       // ============================================================
       // Timer cleanup
@@ -300,15 +338,19 @@ export function createRecipe(): RecipeDefinition {
         }
       }
 
-      function clearCheckTimer(): void {
-        if (checkTimer) {
-          clearTimeout(checkTimer);
-          checkTimer = null;
+      function clearWindowTimers(): void {
+        if (windowStartTimer) {
+          clearTimeout(windowStartTimer);
+          windowStartTimer = null;
+        }
+        if (windowEndTimer) {
+          clearTimeout(windowEndTimer);
+          windowEndTimer = null;
         }
       }
 
       // ============================================================
-      // Value comparison
+      // Condition: watched state AND (no window OR inside window)
       // ============================================================
 
       function matchesWatchValue(value: unknown): boolean {
@@ -320,6 +362,20 @@ export function createRecipe(): RecipeDefinition {
         if (!eq) return undefined;
         const binding = eq.dataBindings.find((b) => b.alias === dataKey);
         return binding?.value;
+      }
+
+      function inWindow(): boolean {
+        if (!hasWindow) return true;
+        const now = new Date();
+        return isWithinWindow(
+          now.getHours() * 60 + now.getMinutes(),
+          hmToMinutes(checkStartStr!),
+          hmToMinutes(checkEndStr!),
+        );
+      }
+
+      function shouldAlarm(): boolean {
+        return matchesWatchValue(readCurrentValue()) && inWindow();
       }
 
       // ============================================================
@@ -335,117 +391,95 @@ export function createRecipe(): RecipeDefinition {
           ctx.state.set("alarmSince", new Date().toISOString());
         }
         ctx.state.set("alarmCount", alarmCount);
+        ctx.log(wasInAlarm ? `ALARM repeat #${alarmCount}` : `ALARM: ${dataKey}=${watchValue}`);
 
-        if (!wasInAlarm) {
-          ctx.log(`ALARM: ${dataKey}=${watchValue}`);
-        } else {
-          ctx.log(`ALARM repeat #${alarmCount}`);
-        }
-
-        // Start repeat timer if configured
-        if (repeatIntervalMs) {
-          startRepeatTimer();
-        }
+        if (repeatIntervalMs) startRepeatTimer();
       }
 
       function startRepeatTimer(): void {
         clearRepeatTimer();
         repeatTimer = setTimeout(() => {
           repeatTimer = null;
-          // Only repeat if still in watched state
-          const currentValue = readCurrentValue();
-          if (matchesWatchValue(currentValue)) {
+          if (shouldAlarm()) {
             raiseAlarm();
+          } else {
+            resetAlarm(`${dataKey} — alarm cleared`);
           }
         }, repeatIntervalMs!);
       }
 
-      // ============================================================
-      // Scheduled check (checkTime)
-      // ============================================================
-
-      function scheduleNextCheck(): void {
-        clearCheckTimer();
-        const ms = msUntilNextOccurrence(checkTimeStr!);
-        checkTimer = setTimeout(() => {
-          checkTimer = null;
-          onScheduledCheck();
-          // Reschedule for next day
-          scheduleNextCheck();
-        }, ms);
+      /** Cancel any pending grace and clear an active alarm. Logs `logMsg` only
+       *  when an alarm was actually active. */
+      function resetAlarm(logMsg?: string): void {
+        clearDelayTimer();
+        clearRepeatTimer();
+        const wasInAlarm = ctx.state.get("alarm") === true;
+        ctx.state.delete("watchStartedAt");
+        if (wasInAlarm) {
+          ctx.state.set("alarm", false);
+          ctx.state.set("alarmSince", null);
+          ctx.state.set("alarmCount", 0);
+          if (logMsg) ctx.log(logMsg);
+        }
       }
 
-      function onScheduledCheck(): void {
-        const currentValue = readCurrentValue();
-        ctx.state.set("currentValue", currentValue);
+      // ============================================================
+      // Core reconciliation — run on value change and window edges
+      // ============================================================
 
-        if (!matchesWatchValue(currentValue)) return;
-
-        const wasInAlarm = ctx.state.get("alarm") === true;
-        const alarmCount = ((ctx.state.get("alarmCount") as number) ?? 0) + 1;
-
-        if (!wasInAlarm) {
-          ctx.state.set("alarm", true);
-          ctx.state.set("alarmSince", new Date().toISOString());
+      function evaluate(): void {
+        if (shouldAlarm()) {
+          if (ctx.state.get("alarm") === true || delayTimer) return; // already alarmed / pending
+          if (delayMs !== null && delayMs > 0) {
+            ctx.state.set("watchStartedAt", new Date().toISOString());
+            delayTimer = setTimeout(() => {
+              delayTimer = null;
+              if (shouldAlarm()) raiseAlarm();
+            }, delayMs);
+            ctx.log(`${dataKey}=${watchValue} — alarm in ${ctx.helpers.formatDuration(delayMs)}`);
+          } else {
+            raiseAlarm();
+          }
+        } else {
+          // Condition no longer holds (value left the state, or window closed).
+          if (ctx.state.get("alarm") === true) {
+            resetAlarm(`${dataKey} — alarm cleared`);
+          } else if (delayTimer) {
+            clearDelayTimer();
+            ctx.state.delete("watchStartedAt");
+          }
         }
-        ctx.state.set("alarmCount", alarmCount);
-        ctx.log(
-          `Check ${checkTimeStr}: ${dataKey}=${watchValue} — ALARM #${alarmCount}`,
-        );
       }
 
       // ============================================================
       // Event handlers
       // ============================================================
 
-      function onValueEntersWatchedState(): void {
-        const now = new Date().toISOString();
-        ctx.state.set("watchStartedAt", now);
-
-        if (delayMs !== null && delayMs > 0) {
-          delayTimer = setTimeout(() => {
-            delayTimer = null;
-            raiseAlarm();
-          }, delayMs);
-          ctx.log(`${dataKey}=${watchValue} — alarm in ${ctx.helpers.formatDuration(delayMs)}`);
-        } else if (delayMs === 0 || (delayMs === null && repeatIntervalMs !== null)) {
-          raiseAlarm();
-        } else if (checkTimeStr) {
-          ctx.log(`${dataKey}=${watchValue} — check at ${checkTimeStr}`);
-        }
-      }
-
-      function onValueLeavesWatchedState(newValue: unknown): void {
-        clearDelayTimer();
-        clearRepeatTimer();
-
-        const wasInAlarm = ctx.state.get("alarm") === true;
-        ctx.state.delete("watchStartedAt");
-
-        if (wasInAlarm) {
-          ctx.state.set("alarm", false);
-          ctx.state.set("alarmSince", null);
-          ctx.state.set("alarmCount", 0);
-          ctx.log(`${dataKey}=${String(newValue)} — alarm cleared`);
-        } else {
-          ctx.log(`${dataKey}=${String(newValue)}`);
-        }
-      }
-
       function onValueChanged(value: unknown): void {
         const previousValue = ctx.state.get("currentValue");
         ctx.state.set("currentValue", value);
-
-        // Skip processing if value hasn't actually changed
         if (String(value) === String(previousValue)) return;
+        evaluate();
+      }
 
-        if (matchesWatchValue(value)) {
-          if (!ctx.state.get("watchStartedAt")) {
-            onValueEntersWatchedState();
-          }
-        } else {
-          onValueLeavesWatchedState(value);
-        }
+      // ============================================================
+      // Check-window boundary timers (re-evaluate at start + end)
+      // ============================================================
+
+      function scheduleWindowStart(): void {
+        windowStartTimer = setTimeout(() => {
+          windowStartTimer = null;
+          evaluate();
+          scheduleWindowStart();
+        }, msUntilNextOccurrence(checkStartStr!));
+      }
+
+      function scheduleWindowEnd(): void {
+        windowEndTimer = setTimeout(() => {
+          windowEndTimer = null;
+          evaluate();
+          scheduleWindowEnd();
+        }, msUntilNextOccurrence(checkEndStr!));
       }
 
       // ============================================================
@@ -455,45 +489,35 @@ export function createRecipe(): RecipeDefinition {
       function restoreState(): void {
         const currentValue = readCurrentValue();
         ctx.state.set("currentValue", currentValue);
-
-        const isInWatchedState = matchesWatchValue(currentValue);
-        const wasInAlarm = ctx.state.get("alarm") === true;
-        const watchStartedAt = ctx.state.get("watchStartedAt") as string | undefined;
-
         ctx.log(`Current: ${dataKey}=${String(currentValue)}`);
 
-        if (!isInWatchedState) {
-          if (wasInAlarm) {
-            ctx.state.set("alarm", false);
-            ctx.state.set("alarmSince", null);
-            ctx.state.set("alarmCount", 0);
-            ctx.state.delete("watchStartedAt");
-            ctx.log("Alarm cleared on restart");
-          }
+        const alarmed = ctx.state.get("alarm") === true;
+
+        if (!shouldAlarm()) {
+          if (alarmed) resetAlarm("Alarm cleared on restart — condition no longer met");
           return;
         }
 
-        if (wasInAlarm) {
-          if (repeatIntervalMs) {
-            startRepeatTimer();
-          }
+        if (alarmed) {
+          if (repeatIntervalMs) startRepeatTimer();
           ctx.log("Alarm still active after restart");
-        } else if (watchStartedAt && delayMs !== null) {
-          // Was waiting for delay — recalculate
-          const elapsed = Date.now() - new Date(watchStartedAt).getTime();
-          const remaining = delayMs - elapsed;
+          return;
+        }
+
+        // Condition holds but not yet alarmed — resume a pending grace or start fresh.
+        const watchStartedAt = ctx.state.get("watchStartedAt") as string | undefined;
+        if (delayMs !== null && delayMs > 0 && watchStartedAt) {
+          const remaining = delayMs - (Date.now() - new Date(watchStartedAt).getTime());
           if (remaining <= 0) {
-            // Delay already expired during downtime
             raiseAlarm();
           } else {
             delayTimer = setTimeout(() => {
               delayTimer = null;
-              raiseAlarm();
+              if (shouldAlarm()) raiseAlarm();
             }, remaining);
           }
-        } else if (!watchStartedAt) {
-          // No watchStartedAt but value is in watched state — treat as fresh entry
-          onValueEntersWatchedState();
+        } else {
+          evaluate();
         }
       }
 
@@ -530,9 +554,10 @@ export function createRecipe(): RecipeDefinition {
       });
       unsubs.push(unsub);
 
-      // Start daily check timer if configured
-      if (checkTimeStr) {
-        scheduleNextCheck();
+      // Schedule check-window edge timers if a window is configured
+      if (hasWindow) {
+        scheduleWindowStart();
+        scheduleWindowEnd();
       }
 
       // Restore state from persistence
@@ -546,7 +571,7 @@ export function createRecipe(): RecipeDefinition {
         stop() {
           clearDelayTimer();
           clearRepeatTimer();
-          clearCheckTimer();
+          clearWindowTimers();
           for (const fn of unsubs) {
             fn();
           }
