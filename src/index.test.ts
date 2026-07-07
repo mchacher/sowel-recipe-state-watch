@@ -115,6 +115,17 @@ describe("state machine (no window)", () => {
     expect(h.getState("alarm")).toBe(false); // closed → cleared
     inst.stop();
   });
+
+  it("exposes only alarm + alarmSince (no alarmCount / currentValue)", () => {
+    const h = makeCtx("closed");
+    const inst = createRecipe().createInstance({ ...baseParams }, h.ctx);
+    h.setValue("open");
+    expect(h.getState("alarm")).toBe(true);
+    expect(typeof h.getState("alarmSince")).toBe("string");
+    expect(h.getState("alarmCount")).toBeNull();
+    expect(h.getState("currentValue")).toBeNull();
+    inst.stop();
+  });
 });
 
 // ============================================================
