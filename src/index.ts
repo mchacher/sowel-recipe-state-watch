@@ -116,7 +116,7 @@ export function createRecipe(): RecipeDefinition {
     id: "state-watch",
     name: "State Watch",
     description:
-      "Monitor an equipment data key and raise an alarm when the value stays in a watched state. Supports delayed alarm, periodic repeat, and daily scheduled check.",
+      "Monitor an equipment data key and raise an alarm while the value stays in a watched state. Permanent by default, with an optional delay and time window. Re-notification is configured on the notification itself.",
 
     slots: [
       {
@@ -155,13 +155,6 @@ export function createRecipe(): RecipeDefinition {
         required: false,
       },
       {
-        id: "repeatInterval",
-        name: "Repeat Interval",
-        description: "Re-alarm interval while still in watched state (e.g., 1h)",
-        type: "duration",
-        required: false,
-      },
-      {
         id: "checkStart",
         name: "Check Window Start",
         description:
@@ -183,7 +176,7 @@ export function createRecipe(): RecipeDefinition {
       fr: {
         name: "Surveillance d'état",
         description:
-          "Surveille une donnée d'équipement et déclenche une alarme si la valeur reste dans un état donné. Surveillance permanente par défaut, avec délai, répétition et créneau horaire optionnels.",
+          "Surveille une donnée d'équipement et déclenche une alarme tant que la valeur reste dans un état donné. Surveillance permanente par défaut, avec délai et créneau horaire optionnels. La re-notification se règle sur la notification.",
         slots: {
           zone: { name: "Zone", description: "Zone de l'équipement à surveiller" },
           equipment: { name: "Équipement", description: "Équipement à surveiller" },
@@ -198,10 +191,6 @@ export function createRecipe(): RecipeDefinition {
           delay: {
             name: "Délai",
             description: "Durée avant la première alarme (ex: 10m)",
-          },
-          repeatInterval: {
-            name: "Intervalle de répétition",
-            description: "Intervalle de rappel tant que l'état persiste (ex: 1h)",
           },
           checkStart: {
             name: "Début du créneau",
@@ -222,8 +211,7 @@ export function createRecipe(): RecipeDefinition {
     // ============================================================
 
     validate(params: Record<string, unknown>, ctx: RecipeContext): void {
-      const { zone, equipment, dataKey, watchValue, delay, repeatInterval, checkStart, checkEnd } =
-        params;
+      const { zone, equipment, dataKey, watchValue, delay, checkStart, checkEnd } = params;
 
       // Validate zone
       if (!zone || typeof zone !== "string") {
@@ -259,13 +247,10 @@ export function createRecipe(): RecipeDefinition {
         throw new Error("Watch value parameter is required");
       }
 
-      // Monitoring is permanent by default — delay, repeat and the check window
-      // are all optional refinements, so no "at least one trigger" requirement.
+      // Monitoring is permanent by default — the delay and the check window are
+      // optional refinements.
       const hasDelay = delay !== undefined && delay !== null && delay !== "";
-      const hasRepeat =
-        repeatInterval !== undefined && repeatInterval !== null && repeatInterval !== "";
       if (hasDelay) ctx.helpers.parseDuration(delay);
-      if (hasRepeat) ctx.helpers.parseDuration(repeatInterval);
 
       // Check window: start and end must be provided together, both valid HH:MM.
       const hasStart = checkStart !== undefined && checkStart !== null && checkStart !== "";
@@ -296,13 +281,6 @@ export function createRecipe(): RecipeDefinition {
           ? ctx.helpers.parseDuration(params.delay)
           : null;
 
-      const repeatIntervalMs =
-        params.repeatInterval !== undefined &&
-        params.repeatInterval !== null &&
-        params.repeatInterval !== ""
-          ? ctx.helpers.parseDuration(params.repeatInterval)
-          : null;
-
       const checkStartStr =
         params.checkStart !== undefined && params.checkStart !== null && params.checkStart !== ""
           ? String(params.checkStart)
@@ -316,7 +294,6 @@ export function createRecipe(): RecipeDefinition {
       // Instance state (closure variables)
       const unsubs: (() => void)[] = [];
       let delayTimer: ReturnType<typeof setTimeout> | null = null;
-      let repeatTimer: ReturnType<typeof setTimeout> | null = null;
       let windowStartTimer: ReturnType<typeof setTimeout> | null = null;
       let windowEndTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -328,13 +305,6 @@ export function createRecipe(): RecipeDefinition {
         if (delayTimer) {
           clearTimeout(delayTimer);
           delayTimer = null;
-        }
-      }
-
-      function clearRepeatTimer(): void {
-        if (repeatTimer) {
-          clearTimeout(repeatTimer);
-          repeatTimer = null;
         }
       }
 
@@ -382,43 +352,22 @@ export function createRecipe(): RecipeDefinition {
       // Alarm management
       // ============================================================
 
+      // Only ever called from a not-alarmed state (evaluate guards on it).
       function raiseAlarm(): void {
-        const wasInAlarm = ctx.state.get("alarm") === true;
-        const alarmCount = ((ctx.state.get("alarmCount") as number) ?? 0) + 1;
-
-        if (!wasInAlarm) {
-          ctx.state.set("alarm", true);
-          ctx.state.set("alarmSince", new Date().toISOString());
-        }
-        ctx.state.set("alarmCount", alarmCount);
-        ctx.log(wasInAlarm ? `ALARM repeat #${alarmCount}` : `ALARM: ${dataKey}=${watchValue}`);
-
-        if (repeatIntervalMs) startRepeatTimer();
-      }
-
-      function startRepeatTimer(): void {
-        clearRepeatTimer();
-        repeatTimer = setTimeout(() => {
-          repeatTimer = null;
-          if (shouldAlarm()) {
-            raiseAlarm();
-          } else {
-            resetAlarm(`${dataKey} — alarm cleared`);
-          }
-        }, repeatIntervalMs!);
+        ctx.state.set("alarm", true);
+        ctx.state.set("alarmSince", new Date().toISOString());
+        ctx.log(`ALARM: ${dataKey}=${watchValue}`);
       }
 
       /** Cancel any pending grace and clear an active alarm. Logs `logMsg` only
        *  when an alarm was actually active. */
       function resetAlarm(logMsg?: string): void {
         clearDelayTimer();
-        clearRepeatTimer();
         const wasInAlarm = ctx.state.get("alarm") === true;
         ctx.state.delete("watchStartedAt");
         if (wasInAlarm) {
           ctx.state.set("alarm", false);
           ctx.state.set("alarmSince", null);
-          ctx.state.set("alarmCount", 0);
           if (logMsg) ctx.log(logMsg);
         }
       }
@@ -452,17 +401,6 @@ export function createRecipe(): RecipeDefinition {
       }
 
       // ============================================================
-      // Event handlers
-      // ============================================================
-
-      function onValueChanged(value: unknown): void {
-        const previousValue = ctx.state.get("currentValue");
-        ctx.state.set("currentValue", value);
-        if (String(value) === String(previousValue)) return;
-        evaluate();
-      }
-
-      // ============================================================
       // Check-window boundary timers (re-evaluate at start + end)
       // ============================================================
 
@@ -487,9 +425,7 @@ export function createRecipe(): RecipeDefinition {
       // ============================================================
 
       function restoreState(): void {
-        const currentValue = readCurrentValue();
-        ctx.state.set("currentValue", currentValue);
-        ctx.log(`Current: ${dataKey}=${String(currentValue)}`);
+        ctx.log(`Current: ${dataKey}=${String(readCurrentValue())}`);
 
         const alarmed = ctx.state.get("alarm") === true;
 
@@ -499,7 +435,6 @@ export function createRecipe(): RecipeDefinition {
         }
 
         if (alarmed) {
-          if (repeatIntervalMs) startRepeatTimer();
           ctx.log("Alarm still active after restart");
           return;
         }
@@ -530,8 +465,6 @@ export function createRecipe(): RecipeDefinition {
       const defaults: Record<string, unknown> = {
         alarm: false,
         alarmSince: null,
-        alarmCount: 0,
-        currentValue: null,
       };
       for (const [key, defaultVal] of Object.entries(defaults)) {
         const current = ctx.state.get(key);
@@ -550,7 +483,7 @@ export function createRecipe(): RecipeDefinition {
       const unsub = ctx.eventBus.onType("equipment.data.changed", (event) => {
         if (event.equipmentId !== equipmentId) return;
         if (event.alias !== dataKey) return;
-        onValueChanged(event.value);
+        evaluate();
       });
       unsubs.push(unsub);
 
@@ -570,7 +503,6 @@ export function createRecipe(): RecipeDefinition {
       return {
         stop() {
           clearDelayTimer();
-          clearRepeatTimer();
           clearWindowTimers();
           for (const fn of unsubs) {
             fn();
@@ -579,8 +511,6 @@ export function createRecipe(): RecipeDefinition {
           // Clear persisted state
           ctx.state.delete("alarm");
           ctx.state.delete("alarmSince");
-          ctx.state.delete("alarmCount");
-          ctx.state.delete("currentValue");
           ctx.state.delete("watchStartedAt");
         },
       };

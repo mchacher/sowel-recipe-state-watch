@@ -2,7 +2,7 @@
   "id": "state-watch",
   "type": "recipe",
   "name": "State Watch",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Monitor an equipment data key and raise an alarm when the value stays in a watched state",
   "icon": "Eye",
   "repo": "mchacher/sowel-recipe-state-watch",
