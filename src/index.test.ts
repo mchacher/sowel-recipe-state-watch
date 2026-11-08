@@ -1,5 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
-import { createRecipe, hmToMinutes, isWithinWindow } from "./index.js";
+import {
+  createRecipe,
+  hmToMinutes,
+  isWithinWindow,
+  watchLabel,
+  formatDelay,
+  buildSummary,
+} from "./index.js";
 
 // ============================================================
 // Pure window helpers
@@ -50,7 +57,7 @@ describe("isWithinWindow", () => {
 
 const baseParams = { zone: "z1", equipment: "eq1", dataKey: "state", watchValue: "open" };
 
-function makeCtx(initialValue: unknown) {
+function makeCtx(initialValue: unknown, category?: string) {
   const store = new Map<string, unknown>();
   let value = initialValue;
   let handler: ((e: Record<string, unknown>) => void) | null = null;
@@ -65,7 +72,7 @@ function makeCtx(initialValue: unknown) {
       getByIdWithDetails: () => ({
         name: "Eq",
         zoneId: "z1",
-        dataBindings: [{ alias: "state", value }],
+        dataBindings: [{ alias: "state", value, category }],
         orderBindings: [],
       }),
     },
@@ -199,5 +206,109 @@ describe("validate", () => {
     expect(() =>
       recipe.validate({ ...baseParams, checkStart: "9pm", checkEnd: "06:00" }, vctx),
     ).toThrow(/time/i);
+  });
+});
+
+// ============================================================
+// Summary — what the instance watches (sowel#1165)
+// ============================================================
+
+describe("watchLabel", () => {
+  it("labels UPS statuses like the UPS card does", () => {
+    expect(watchLabel("status", "on_battery", "ups_status")).toBe("Sur batterie");
+    expect(watchLabel("status", "low_battery", "ups_status")).toBe("Batterie faible");
+    expect(watchLabel("status", "offline", "ups_status")).toBe("Sortie coupée");
+  });
+  it("labels booleans by category, contacts reading false as open", () => {
+    expect(watchLabel("state", "false", "light_state")).toBe("Éteint");
+    expect(watchLabel("contact", "false", "contact_door")).toBe("Ouvert");
+    expect(watchLabel("leak", "true", "water_leak")).toBe("Fuite d'eau");
+  });
+  it("labels gate and appliance states", () => {
+    expect(watchLabel("state", "open", "gate_state")).toBe("Ouvert");
+    expect(watchLabel("state", "ready", "appliance_state")).toBe("Prêt");
+  });
+  it("reads a stove fault code on a generic binding", () => {
+    expect(watchLabel("stoveState", "error_A02", "generic")).toBe("Erreur A02");
+    expect(watchLabel("stoveState", "off", "generic")).toBe("Éteint");
+  });
+  it("falls back to « key : value » for an unknown value", () => {
+    expect(watchLabel("state", "half_open", "gate_state")).toBe("state : half_open");
+    expect(watchLabel("mode", "eco")).toBe("mode : eco");
+  });
+});
+
+describe("formatDelay", () => {
+  it("formats seconds, minutes and hours", () => {
+    expect(formatDelay(30_000)).toBe("30 s");
+    expect(formatDelay(60_000)).toBe("1 min");
+    expect(formatDelay(10 * 60_000)).toBe("10 min");
+    expect(formatDelay(2 * 3_600_000)).toBe("2 h");
+    expect(formatDelay(90 * 60_000)).toBe("1 h 30");
+  });
+});
+
+describe("buildSummary", () => {
+  it("leads with the watched state, then the delay and the window", () => {
+    expect(buildSummary({ label: "Ouvert", delayMs: 600_000, window: null, alarm: false })).toBe(
+      "Ouvert · après 10 min",
+    );
+    expect(
+      buildSummary({
+        label: "Ouvert",
+        delayMs: 0,
+        window: { start: "21:00", end: "05:00" },
+        alarm: false,
+      }),
+    ).toBe("Ouvert · 21:00–05:00");
+    expect(buildSummary({ label: "Batterie faible", delayMs: null, window: null, alarm: false })).toBe(
+      "Batterie faible",
+    );
+  });
+  it("shows the live alarm in place of the settings", () => {
+    expect(buildSummary({ label: "Sur batterie", delayMs: 60_000, window: null, alarm: true })).toBe(
+      "Sur batterie · en alarme",
+    );
+  });
+});
+
+describe("state.summary on an instance", () => {
+  it("is set at start, follows the alarm, and stays without it after stop", () => {
+    vi.useFakeTimers();
+    const h = makeCtx("online", "ups_status");
+    const inst = createRecipe().createInstance(
+      { ...baseParams, dataKey: "state", watchValue: "on_battery", delay: "1m" },
+      h.ctx,
+    );
+    expect(h.getState("summary")).toBe("Sur batterie · après 1 min");
+
+    h.setValue("on_battery");
+    expect(h.getState("summary")).toBe("Sur batterie · après 1 min"); // grace, not yet alarmed
+    vi.advanceTimersByTime(60_000);
+    expect(h.getState("alarm")).toBe(true);
+    expect(h.getState("summary")).toBe("Sur batterie · en alarme");
+
+    h.setValue("online");
+    expect(h.getState("summary")).toBe("Sur batterie · après 1 min");
+
+    h.setValue("on_battery");
+    vi.advanceTimersByTime(60_000);
+    inst.stop();
+    expect(h.getState("summary")).toBe("Sur batterie · après 1 min");
+    vi.useRealTimers();
+  });
+
+  it("reflects an alarm already active when the instance starts", () => {
+    const h = makeCtx("open", "gate_state");
+    const inst = createRecipe().createInstance({ ...baseParams }, h.ctx);
+    expect(h.getState("summary")).toBe("Ouvert · en alarme");
+    inst.stop();
+  });
+
+  it("uses the generic form when the binding carries no known category", () => {
+    const h = makeCtx("closed");
+    const inst = createRecipe().createInstance({ ...baseParams, watchValue: "ajar" }, h.ctx);
+    expect(h.getState("summary")).toBe("state : ajar");
+    inst.stop();
   });
 });

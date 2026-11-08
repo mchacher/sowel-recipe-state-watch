@@ -11,7 +11,7 @@ interface RecipeContext {
     getByIdWithDetails(id: string): {
       name: string;
       zoneId?: string;
-      dataBindings: Array<{ alias: string; value?: unknown }>;
+      dataBindings: Array<{ alias: string; value?: unknown; category?: string }>;
       orderBindings: Array<{ alias: string; enumValues?: string[] }>;
     } | null;
   };
@@ -105,6 +105,88 @@ export function isWithinWindow(nowMinutes: number, startMin: number, endMin: num
   if (startMin === endMin) return false;
   if (startMin < endMin) return nowMinutes >= startMin && nowMinutes < endMin;
   return nowMinutes >= startMin || nowMinutes < endMin;
+}
+
+// ============================================================
+// Summary — what this instance watches (sowel#1165)
+// ============================================================
+
+/**
+ * Readable labels for a watched value, keyed by the binding's data category,
+ * then by the raw value as the recipe compares it (`String(value)`). They
+ * mirror the labels the Sowel UI shows for the same values, so the recipe row
+ * reads like the equipment card. French, like the summaries of the other
+ * recipes: the recipe context exposes no user language.
+ */
+const CATEGORY_VALUE_LABELS: Record<string, Record<string, string>> = {
+  ups_status: {
+    online: "Sur secteur",
+    on_battery: "Sur batterie",
+    bypass: "By-pass",
+    overload: "Surcharge",
+    low_battery: "Batterie faible",
+    offline: "Sortie coupée",
+  },
+  gate_state: { open: "Ouvert", closed: "Fermé" },
+  // Contact convention: false = open.
+  contact_door: { false: "Ouvert", true: "Fermé" },
+  contact_window: { false: "Ouvert", true: "Fermé" },
+  light_state: { true: "Allumé", false: "Éteint" },
+  motion: { true: "Mouvement détecté", false: "Aucun mouvement" },
+  water_leak: { true: "Fuite d'eau", false: "Pas de fuite" },
+  smoke: { true: "Fumée détectée", false: "Pas de fumée" },
+  appliance_state: { ready: "Prêt", running: "En marche", paused: "En pause" },
+};
+
+/** Labels keyed by data alias, for data whose category is `generic`. */
+const ALIAS_VALUE_LABELS: Record<string, Record<string, string>> = {
+  stoveState: { off: "Éteint", running: "En marche", standby: "Veille", error: "Erreur" },
+};
+
+/**
+ * A short, human line naming what is watched: « Sur batterie », « Erreur A02 »,
+ * or « state : ready » when the value has no known label.
+ */
+export function watchLabel(dataKey: string, watchValue: string, category?: string): string {
+  const byCategory = category ? CATEGORY_VALUE_LABELS[category]?.[watchValue] : undefined;
+  if (byCategory) return byCategory;
+  const byAlias = ALIAS_VALUE_LABELS[dataKey]?.[watchValue];
+  if (byAlias) return byAlias;
+  // Stove fault codes (`error_A01`…`error_A20`, MCZ plugin).
+  const err = /^error_(.+)$/i.exec(watchValue);
+  if (err) return `Erreur ${err[1]}`;
+  return `${dataKey} : ${watchValue}`;
+}
+
+/** « 30 s », « 10 min », « 2 h », « 1 h 30 ». */
+export function formatDelay(ms: number): string {
+  if (ms < 60_000) return `${Math.round(ms / 1000)} s`;
+  const totalMin = Math.round(ms / 60_000);
+  if (totalMin < 60) return `${totalMin} min`;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return m === 0 ? `${h} h` : `${h} h ${String(m).padStart(2, "0")}`;
+}
+
+/**
+ * The instance's one-line summary. The watched state always leads, so that
+ * two instances on one equipment read apart; then the live alarm, or else the
+ * delay and the check window that set this instance apart from a sibling.
+ */
+export function buildSummary(opts: {
+  label: string;
+  delayMs: number | null;
+  window: { start: string; end: string } | null;
+  alarm: boolean;
+}): string {
+  const parts = [opts.label];
+  if (opts.alarm) {
+    parts.push("en alarme");
+  } else {
+    if (opts.delayMs !== null && opts.delayMs > 0) parts.push(`après ${formatDelay(opts.delayMs)}`);
+    if (opts.window) parts.push(`${opts.window.start}–${opts.window.end}`);
+  }
+  return parts.join(" · ");
 }
 
 // ============================================================
@@ -291,6 +373,37 @@ export function createRecipe(): RecipeDefinition {
           : null;
       const hasWindow = checkStartStr !== null && checkEndStr !== null;
 
+      // ============================================================
+      // Summary (state.summary) — what this instance watches, shown on its
+      // recipe row. The binding's category is read once, at start; editing
+      // the instance restarts it and so recomputes the label.
+      // ============================================================
+
+      function watchedCategory(): string | undefined {
+        try {
+          const eq = ctx.equipmentManager.getByIdWithDetails(equipmentId);
+          return eq?.dataBindings.find((b) => b.alias === dataKey)?.category;
+        } catch {
+          return undefined;
+        }
+      }
+
+      const label = watchLabel(dataKey, watchValue, watchedCategory());
+
+      function publishSummary(alarm: boolean): void {
+        try {
+          const summary = buildSummary({
+            label,
+            delayMs,
+            window: hasWindow ? { start: checkStartStr!, end: checkEndStr! } : null,
+            alarm,
+          });
+          if (ctx.state.get("summary") !== summary) ctx.state.set("summary", summary);
+        } catch (err) {
+          ctx.logger.error({ err }, "Failed to publish the state-watch summary");
+        }
+      }
+
       // Instance state (closure variables)
       const unsubs: (() => void)[] = [];
       let delayTimer: ReturnType<typeof setTimeout> | null = null;
@@ -356,6 +469,7 @@ export function createRecipe(): RecipeDefinition {
       function raiseAlarm(): void {
         ctx.state.set("alarm", true);
         ctx.state.set("alarmSince", new Date().toISOString());
+        publishSummary(true);
         ctx.log(`ALARM: ${dataKey}=${watchValue}`);
       }
 
@@ -368,6 +482,7 @@ export function createRecipe(): RecipeDefinition {
         if (wasInAlarm) {
           ctx.state.set("alarm", false);
           ctx.state.set("alarmSince", null);
+          publishSummary(false);
           if (logMsg) ctx.log(logMsg);
         }
       }
@@ -483,7 +598,11 @@ export function createRecipe(): RecipeDefinition {
       const unsub = ctx.eventBus.onType("equipment.data.changed", (event) => {
         if (event.equipmentId !== equipmentId) return;
         if (event.alias !== dataKey) return;
-        evaluate();
+        try {
+          evaluate();
+        } catch (err) {
+          ctx.logger.error({ err, equipmentId, dataKey }, "State-watch evaluation failed");
+        }
       });
       unsubs.push(unsub);
 
@@ -495,6 +614,9 @@ export function createRecipe(): RecipeDefinition {
 
       // Restore state from persistence
       restoreState();
+
+      // After the restore, which may have raised or cleared the alarm.
+      publishSummary(ctx.state.get("alarm") === true);
 
       // ============================================================
       // Return instance handle
@@ -512,6 +634,8 @@ export function createRecipe(): RecipeDefinition {
           ctx.state.delete("alarm");
           ctx.state.delete("alarmSince");
           ctx.state.delete("watchStartedAt");
+          // The summary names the instance, so it stays — without the alarm.
+          publishSummary(false);
         },
       };
     },
