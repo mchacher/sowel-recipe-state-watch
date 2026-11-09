@@ -169,9 +169,15 @@ export function formatDelay(ms: number): string {
 }
 
 /**
- * The instance's one-line summary. The watched state always leads, so that
- * two instances on one equipment read apart; then the live alarm, or else the
- * delay and the check window that set this instance apart from a sibling.
+ * The instance's one-line summary, a plain French phrase. The watched state
+ * always leads, so that two instances on one equipment read apart; then the
+ * live alarm, or else the delay and the check window that set this instance
+ * apart from a sibling:
+ *
+ *   « Erreur A01 », « Erreur A01 après 1 min », « Erreur A02 en alarme »,
+ *   « Ouvert de 21:00 à 05:00 », « Ouvert après 10 min, de 21:00 à 05:00 ».
+ *
+ * No middle dot (U+00B7): Sowel text never uses one (sowel#1188).
  */
 export function buildSummary(opts: {
   label: string;
@@ -179,14 +185,14 @@ export function buildSummary(opts: {
   window: { start: string; end: string } | null;
   alarm: boolean;
 }): string {
-  const parts = [opts.label];
-  if (opts.alarm) {
-    parts.push("en alarme");
-  } else {
-    if (opts.delayMs !== null && opts.delayMs > 0) parts.push(`après ${formatDelay(opts.delayMs)}`);
-    if (opts.window) parts.push(`${opts.window.start}–${opts.window.end}`);
-  }
-  return parts.join(" · ");
+  if (opts.alarm) return `${opts.label} en alarme`;
+  const delay =
+    opts.delayMs !== null && opts.delayMs > 0 ? `après ${formatDelay(opts.delayMs)}` : null;
+  const window = opts.window ? `de ${opts.window.start} à ${opts.window.end}` : null;
+  if (delay && window) return `${opts.label} ${delay}, ${window}`;
+  if (delay) return `${opts.label} ${delay}`;
+  if (window) return `${opts.label} ${window}`;
+  return opts.label;
 }
 
 // ============================================================
@@ -470,7 +476,7 @@ export function createRecipe(): RecipeDefinition {
         ctx.state.set("alarm", true);
         ctx.state.set("alarmSince", new Date().toISOString());
         publishSummary(true);
-        ctx.log(`ALARM: ${dataKey}=${watchValue}`);
+        ctx.log(`ALARM: ${dataKey}=${watchValue}`, "error");
       }
 
       /** Cancel any pending grace and clear an active alarm. Logs `logMsg` only
