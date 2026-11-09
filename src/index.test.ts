@@ -59,6 +59,7 @@ const baseParams = { zone: "z1", equipment: "eq1", dataKey: "state", watchValue:
 
 function makeCtx(initialValue: unknown, category?: string) {
   const store = new Map<string, unknown>();
+  const logs: Array<{ message: string; level: "info" | "warn" | "error" }> = [];
   let value = initialValue;
   let handler: ((e: Record<string, unknown>) => void) | null = null;
   const ctx = {
@@ -84,7 +85,8 @@ function makeCtx(initialValue: unknown, category?: string) {
       delete: (k: string) => void store.delete(k),
       clear: () => store.clear(),
     },
-    log: () => {},
+    log: (message: string, level: "info" | "warn" | "error" = "info") =>
+      void logs.push({ message, level }),
     helpers: {
       parseDuration: (v: unknown) => {
         const m = /^(\d+)(s|m|h)$/.exec(String(v));
@@ -98,6 +100,7 @@ function makeCtx(initialValue: unknown, category?: string) {
   return {
     ctx: ctx as unknown as Parameters<ReturnType<typeof createRecipe>["createInstance"]>[1],
     getState: (k: string) => (store.has(k) ? store.get(k) : null),
+    logs,
     setValue(v: unknown) {
       value = v;
       handler?.({ equipmentId: "eq1", alias: "state", value: v });
@@ -120,6 +123,16 @@ describe("state machine (no window)", () => {
 
     h.setValue("closed");
     expect(h.getState("alarm")).toBe(false); // closed → cleared
+    inst.stop();
+  });
+
+  it("logs the alarm at level error, its clearing at level info", () => {
+    const h = makeCtx("closed");
+    const inst = createRecipe().createInstance({ ...baseParams }, h.ctx);
+    h.setValue("open");
+    expect(h.logs).toContainEqual({ message: "ALARM: state=open", level: "error" });
+    h.setValue("closed");
+    expect(h.logs).toContainEqual({ message: "state — alarm cleared", level: "info" });
     inst.stop();
   });
 
@@ -251,7 +264,7 @@ describe("formatDelay", () => {
 describe("buildSummary", () => {
   it("leads with the watched state, then the delay and the window", () => {
     expect(buildSummary({ label: "Ouvert", delayMs: 600_000, window: null, alarm: false })).toBe(
-      "Ouvert · après 10 min",
+      "Ouvert après 10 min",
     );
     expect(
       buildSummary({
@@ -260,14 +273,49 @@ describe("buildSummary", () => {
         window: { start: "21:00", end: "05:00" },
         alarm: false,
       }),
-    ).toBe("Ouvert · 21:00–05:00");
+    ).toBe("Ouvert de 21:00 à 05:00");
     expect(buildSummary({ label: "Batterie faible", delayMs: null, window: null, alarm: false })).toBe(
       "Batterie faible",
     );
   });
+  it("joins the delay and the window in one phrase", () => {
+    expect(
+      buildSummary({
+        label: "Ouvert",
+        delayMs: 600_000,
+        window: { start: "21:00", end: "05:00" },
+        alarm: false,
+      }),
+    ).toBe("Ouvert après 10 min, de 21:00 à 05:00");
+    expect(buildSummary({ label: "Erreur A01", delayMs: null, window: null, alarm: false })).toBe(
+      "Erreur A01",
+    );
+    expect(buildSummary({ label: "Erreur A01", delayMs: 60_000, window: null, alarm: false })).toBe(
+      "Erreur A01 après 1 min",
+    );
+  });
+  it("never emits a middle dot, whatever the combination (sowel#1188)", () => {
+    const window = { start: "21:00", end: "05:00" };
+    for (const delayMs of [null, 0, 60_000]) {
+      for (const w of [null, window]) {
+        for (const alarm of [false, true]) {
+          const summary = buildSummary({ label: "Erreur A02", delayMs, window: w, alarm });
+          expect(summary).not.toContain("\u00B7");
+        }
+      }
+    }
+  });
   it("shows the live alarm in place of the settings", () => {
+    expect(
+      buildSummary({
+        label: "Erreur A02",
+        delayMs: 60_000,
+        window: { start: "21:00", end: "05:00" },
+        alarm: true,
+      }),
+    ).toBe("Erreur A02 en alarme");
     expect(buildSummary({ label: "Sur batterie", delayMs: 60_000, window: null, alarm: true })).toBe(
-      "Sur batterie · en alarme",
+      "Sur batterie en alarme",
     );
   });
 });
@@ -280,28 +328,28 @@ describe("state.summary on an instance", () => {
       { ...baseParams, dataKey: "state", watchValue: "on_battery", delay: "1m" },
       h.ctx,
     );
-    expect(h.getState("summary")).toBe("Sur batterie · après 1 min");
+    expect(h.getState("summary")).toBe("Sur batterie après 1 min");
 
     h.setValue("on_battery");
-    expect(h.getState("summary")).toBe("Sur batterie · après 1 min"); // grace, not yet alarmed
+    expect(h.getState("summary")).toBe("Sur batterie après 1 min"); // grace, not yet alarmed
     vi.advanceTimersByTime(60_000);
     expect(h.getState("alarm")).toBe(true);
-    expect(h.getState("summary")).toBe("Sur batterie · en alarme");
+    expect(h.getState("summary")).toBe("Sur batterie en alarme");
 
     h.setValue("online");
-    expect(h.getState("summary")).toBe("Sur batterie · après 1 min");
+    expect(h.getState("summary")).toBe("Sur batterie après 1 min");
 
     h.setValue("on_battery");
     vi.advanceTimersByTime(60_000);
     inst.stop();
-    expect(h.getState("summary")).toBe("Sur batterie · après 1 min");
+    expect(h.getState("summary")).toBe("Sur batterie après 1 min");
     vi.useRealTimers();
   });
 
   it("reflects an alarm already active when the instance starts", () => {
     const h = makeCtx("open", "gate_state");
     const inst = createRecipe().createInstance({ ...baseParams }, h.ctx);
-    expect(h.getState("summary")).toBe("Ouvert · en alarme");
+    expect(h.getState("summary")).toBe("Ouvert en alarme");
     inst.stop();
   });
 
